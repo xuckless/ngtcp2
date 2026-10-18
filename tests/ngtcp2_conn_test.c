@@ -83,6 +83,7 @@ static const MunitTest tests[] = {
   munit_void_test(test_ngtcp2_conn_recv_new_connection_id),
   munit_void_test(test_ngtcp2_conn_recv_retire_connection_id),
   munit_void_test(test_ngtcp2_conn_server_path_validation),
+  munit_void_test(test_ngtcp2_conn_server_migration_after_nat_rebinding),
   munit_void_test(test_ngtcp2_conn_client_connection_migration),
   munit_void_test(test_ngtcp2_conn_recv_path_challenge),
   munit_void_test(test_ngtcp2_conn_disable_active_migration),
@@ -11199,6 +11200,155 @@ void test_ngtcp2_conn_client_connection_migration(void) {
   assert_true(conn->dcid.current.flags & NGTCP2_DCID_FLAG_PATH_VALIDATED);
 
   ngtcp2_conn_del(conn);
+}
+
+static void assert_dcid_not_retired(ngtcp2_conn *conn, uint64_t seq) {
+  ngtcp2_frame_chain *frc;
+
+  for (frc = conn->pktns.tx.frq; frc; frc = frc->next) {
+    if (frc->fr.hd.type == NGTCP2_FRAME_RETIRE_CONNECTION_ID) {
+      assert_uint64(seq, !=, frc->fr.retire_connection_id.seq);
+    }
+  }
+}
+
+void test_ngtcp2_conn_server_migration_after_nat_rebinding(void) {
+  ngtcp2_conn *conn;
+  uint8_t buf[2048];
+  size_t pktlen;
+  ngtcp2_ssize spktlen;
+  ngtcp2_tstamp t = 900;
+  ngtcp2_frame fr;
+  ngtcp2_frame frs[2];
+  int rv;
+  static const ngtcp2_cid cid = {
+    .datalen = 4,
+    .data = {0x0F, 0x00, 0x00, 0x00},
+  };
+  static const ngtcp2_stateless_reset_token token = {
+    .data = {0xFF},
+  };
+  ngtcp2_cid orig_dcid;
+  ngtcp2_path_storage migrated_path;
+  ngtcp2_ksl_it it;
+  ngtcp2_tpe tpe;
+  size_t i;
+
+  /* The remote endpoint migrates to a new port (and switches to a new
+     connection ID) right after a NAT rebinding, which kept the
+     connection ID: first while the rebinding is still being validated
+     (i == 0), then after it was validated (i == 1, a path validation
+     of the original path still runs).  The DCID the server used before
+     both stays the fallback, so it must not be retired. */
+  path_init(&migrated_path, 0, 0, 0, 2);
+
+  for (i = 0; i < 2; ++i) {
+    setup_default_server(&conn);
+    ngtcp2_tpe_init_conn(&tpe, conn);
+
+    /* This will send NEW_CONNECTION_ID frames */
+    spktlen = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ++t);
+
+    assert_ptrdiff(0, <, spktlen);
+
+    ngtcp2_cid_init(&orig_dcid, conn->dcid.current.cid.data,
+                    conn->dcid.current.cid.datalen);
+
+    fr.new_connection_id = (ngtcp2_new_connection_id){
+      .type = NGTCP2_FRAME_NEW_CONNECTION_ID,
+      .seq = 1,
+      .cid = cid,
+      .token = token,
+    };
+
+    pktlen = ngtcp2_tpe_write_1rtt(&tpe, buf, sizeof(buf), &fr, 1);
+
+    rv = ngtcp2_conn_read_pkt(conn, &null_path.path, NULL, buf, pktlen, ++t);
+
+    assert_int(0, ==, rv);
+
+    /* NAT rebinding: a new remote port, the same connection ID.
+       Padded, so that the server may send a full sized
+       PATH_CHALLENGE. */
+    frs[0].ping.type = NGTCP2_FRAME_PING;
+    frs[1].padding = (ngtcp2_padding){
+      .type = NGTCP2_FRAME_PADDING,
+      .len = 1200,
+    };
+
+    pktlen = ngtcp2_tpe_write_1rtt(&tpe, buf, sizeof(buf), frs, 2);
+
+    rv =
+      ngtcp2_conn_read_pkt(conn, &new_nat_path.path, NULL, buf, pktlen, ++t);
+
+    assert_int(0, ==, rv);
+    assert_not_null(conn->pv);
+    assert_uint64(0, ==, conn->pv->dcid.seq);
+    assert_true(conn->pv->flags & NGTCP2_PV_FLAG_FALLBACK_PRESENT);
+    assert_uint64(0, ==, conn->pv->fallback_dcid.seq);
+
+    if (i == 1) {
+      spktlen = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ++t);
+
+      assert_ptrdiff(0, <, spktlen);
+
+      fr.path_response = (ngtcp2_path_response){
+        .type = NGTCP2_FRAME_PATH_RESPONSE,
+      };
+
+      pktlen = ngtcp2_tpe_write_1rtt(&tpe, buf, sizeof(buf), &fr, 1);
+
+      rv = ngtcp2_conn_read_pkt(conn, &new_nat_path.path, NULL, buf, pktlen,
+                                ++t);
+
+      assert_int(0, ==, rv);
+      assert_true(
+        ngtcp2_path_eq(&new_nat_path.path, &conn->dcid.current.ps.path));
+      /* The original path is validated again, and nothing depends on
+         the outcome. */
+      assert_not_null(conn->pv);
+      assert_true(conn->pv->flags & NGTCP2_PV_FLAG_DONT_CARE);
+      assert_uint64(0, ==, conn->pv->dcid.seq);
+    }
+
+    /* Migration: a new remote port and a new connection ID. */
+    fr.ping.type = NGTCP2_FRAME_PING;
+
+    it = ngtcp2_ksl_begin(&conn->scid.set);
+
+    assert(!ngtcp2_ksl_it_end(&it));
+
+    tpe.dcid = ((ngtcp2_scid *)ngtcp2_ksl_it_get(&it))->cid;
+
+    pktlen = ngtcp2_tpe_write_1rtt(&tpe, buf, sizeof(buf), &fr, 1);
+
+    rv =
+      ngtcp2_conn_read_pkt(conn, &migrated_path.path, NULL, buf, pktlen, ++t);
+
+    assert_int(0, ==, rv);
+    assert_not_null(conn->pv);
+    assert_uint64(1, ==, conn->pv->dcid.seq);
+    assert_true(conn->pv->flags & NGTCP2_PV_FLAG_FALLBACK_PRESENT);
+    assert_uint64(0, ==, conn->pv->fallback_dcid.seq);
+    assert_dcid_not_retired(conn, 0);
+
+    /* Path validation fails: the connection falls back to the DCID it
+       kept. */
+    spktlen = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ++t);
+
+    assert_ptrdiff(0, <, spktlen);
+
+    t += conn->pv->timeout;
+
+    spktlen = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ++t);
+
+    assert_ptrdiff(0, <, spktlen);
+    assert_true(ngtcp2_cid_eq(&orig_dcid, &conn->dcid.current.cid));
+    assert_uint64(0, ==, conn->dcid.current.seq);
+    assert_dcid_not_retired(conn, 0);
+
+    ngtcp2_conn_del(conn);
+  }
 }
 
 void test_ngtcp2_conn_recv_path_challenge(void) {

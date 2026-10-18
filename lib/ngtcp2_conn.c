@@ -5069,7 +5069,31 @@ static ngtcp2_ssize conn_write_pmtud_probe(ngtcp2_conn *conn,
  * NGTCP2_ERR_NOMEM
  *     Out of memory
  */
-static int conn_stop_pv(ngtcp2_conn *conn, ngtcp2_tstamp ts) {
+/*
+ * pv_uses_dcid returns nonzero if |pv| is not NULL, and it still uses
+ * the DCID of sequence number |seq|, either as the DCID of the path
+ * being validated or as its fallback.
+ */
+static int pv_uses_dcid(const ngtcp2_pv *pv, uint64_t seq) {
+  return pv && (pv->dcid.seq == seq ||
+                ((pv->flags & NGTCP2_PV_FLAG_FALLBACK_PRESENT) &&
+                 pv->fallback_dcid.seq == seq));
+}
+
+/*
+ * conn_stop_pv_keep stops the path validation which is currently
+ * running, like conn_stop_pv.  It does not retire a DCID that
+ * |next|, the path validation which replaces it, still uses.  |next|
+ * may be NULL.
+ *
+ * This function returns 0 if it succeeds, or one of the following
+ * negative error codes:
+ *
+ * NGTCP2_ERR_NOMEM
+ *     Out of memory
+ */
+static int conn_stop_pv_keep(ngtcp2_conn *conn, const ngtcp2_pv *next,
+                             ngtcp2_tstamp ts) {
   int rv = 0;
   ngtcp2_pv *pv = conn->pv;
 
@@ -5077,7 +5101,8 @@ static int conn_stop_pv(ngtcp2_conn *conn, ngtcp2_tstamp ts) {
     return 0;
   }
 
-  if (pv->dcid.cid.datalen && pv->dcid.seq != conn->dcid.current.seq) {
+  if (pv->dcid.cid.datalen && pv->dcid.seq != conn->dcid.current.seq &&
+      !pv_uses_dcid(next, pv->dcid.seq)) {
     rv = conn_retire_active_dcid(conn, &pv->dcid, ts);
     if (rv != 0) {
       goto fin;
@@ -5087,7 +5112,8 @@ static int conn_stop_pv(ngtcp2_conn *conn, ngtcp2_tstamp ts) {
   if ((pv->flags & NGTCP2_PV_FLAG_FALLBACK_PRESENT) &&
       pv->fallback_dcid.cid.datalen &&
       pv->fallback_dcid.seq != conn->dcid.current.seq &&
-      pv->fallback_dcid.seq != pv->dcid.seq) {
+      pv->fallback_dcid.seq != pv->dcid.seq &&
+      !pv_uses_dcid(next, pv->fallback_dcid.seq)) {
     rv = conn_retire_active_dcid(conn, &pv->fallback_dcid, ts);
     if (rv != 0) {
       goto fin;
@@ -5099,6 +5125,10 @@ fin:
   conn->pv = NULL;
 
   return rv;
+}
+
+static int conn_stop_pv(ngtcp2_conn *conn, ngtcp2_tstamp ts) {
+  return conn_stop_pv_keep(conn, NULL, ts);
 }
 
 /*
@@ -5114,7 +5144,8 @@ fin:
  * NGTCP2_ERR_CALLBACK_FAILURE
  *     User-defined callback function failed.
  */
-static int conn_abort_pv(ngtcp2_conn *conn, ngtcp2_tstamp ts) {
+static int conn_abort_pv_keep(ngtcp2_conn *conn, const ngtcp2_pv *next,
+                              ngtcp2_tstamp ts) {
   ngtcp2_pv *pv = conn->pv;
   int rv;
 
@@ -5128,7 +5159,11 @@ static int conn_abort_pv(ngtcp2_conn *conn, ngtcp2_tstamp ts) {
     }
   }
 
-  return conn_stop_pv(conn, ts);
+  return conn_stop_pv_keep(conn, next, ts);
+}
+
+static int conn_abort_pv(ngtcp2_conn *conn, ngtcp2_tstamp ts) {
+  return conn_abort_pv_keep(conn, NULL, ts);
 }
 
 static size_t conn_shape_udp_payload(const ngtcp2_conn *conn,
@@ -9023,7 +9058,10 @@ static int conn_recv_non_probing_pkt_on_new_path(ngtcp2_conn *conn,
     ngtcp2_log_info(
       &conn->log, NGTCP2_LOG_EVENT_PTV,
       "path migration is aborted because new migration has started");
-    rv = conn_abort_pv(conn, ts);
+    /* The new path validation may still use a DCID of the one it
+       replaces: the DCID of a NAT rebinding, which did not change it,
+       as its fallback. */
+    rv = conn_abort_pv_keep(conn, pv, ts);
     if (rv != 0) {
       return rv;
     }
