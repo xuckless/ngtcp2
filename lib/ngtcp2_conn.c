@@ -2717,7 +2717,7 @@ conn_write_handshake_pkt(ngtcp2_conn *conn, ngtcp2_pkt_info *pi, uint8_t *dest,
         pktns->rtb.num_retransmittable && pktns->rtb.probe_pkt_left) {
       num_reclaimed = ngtcp2_rtb_reclaim_on_pto(
         &pktns->rtb, conn, pktns,
-        !conn->server && type == NGTCP2_PKT_INITIAL ? 2 : 1);
+        type == NGTCP2_PKT_INITIAL ? 2 : 1);
       if (num_reclaimed < 0) {
         ngtcp2_frame_chain_list_objalloc_del(frq, &conn->frc_objalloc,
                                              conn->mem);

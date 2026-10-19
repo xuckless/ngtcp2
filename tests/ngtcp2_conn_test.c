@@ -102,6 +102,7 @@ static const MunitTest tests[] = {
   munit_void_test(test_ngtcp2_conn_write_application_close),
   munit_void_test(test_ngtcp2_conn_rtb_reclaim_on_pto),
   munit_void_test(test_ngtcp2_conn_rtb_reclaim_on_pto_datagram),
+  munit_void_test(test_ngtcp2_conn_server_initial_pto_reclaim),
   munit_void_test(test_ngtcp2_conn_validate_ecn),
   munit_void_test(test_ngtcp2_conn_path_validation),
   munit_void_test(test_ngtcp2_conn_early_data_sync_stream_data_limit),
@@ -599,6 +600,24 @@ static int recv_crypto_fatal_alert_generated(
   (void)datalen;
   (void)user_data;
   return NGTCP2_ERR_CRYPTO;
+}
+
+/* Answers a ClientHello with an Initial flight that needs two packets,
+   as a ServerHello with a post-quantum key share does. */
+static int recv_crypto_data_server_large_initial(
+  ngtcp2_conn *conn, ngtcp2_encryption_level encryption_level, uint64_t offset,
+  const uint8_t *data, size_t datalen, void *user_data) {
+  (void)offset;
+  (void)data;
+  (void)datalen;
+  (void)user_data;
+
+  if (encryption_level == NGTCP2_ENCRYPTION_LEVEL_INITIAL) {
+    ngtcp2_conn_submit_crypto_data(conn, NGTCP2_ENCRYPTION_LEVEL_INITIAL,
+                                   null_data, 1500);
+  }
+
+  return 0;
 }
 
 static int recv_crypto_data_server(ngtcp2_conn *conn,
@@ -14353,6 +14372,108 @@ void test_ngtcp2_conn_rtb_reclaim_on_pto_datagram(void) {
   }
 
   assert_size(1, ==, num_reclaim_pkt);
+
+  ngtcp2_conn_del(conn);
+}
+
+void test_ngtcp2_conn_server_initial_pto_reclaim(void) {
+  ngtcp2_conn *conn;
+  uint8_t buf[2048];
+  size_t pktlen;
+  ngtcp2_ssize spktlen;
+  ngtcp2_vec datav;
+  ngtcp2_frame fr;
+  ngtcp2_tstamp t = 0;
+  int rv;
+  ngtcp2_tpe tpe;
+  ngtcp2_callbacks callbacks;
+  conn_options opts;
+  ngtcp2_ksl_it it;
+  ngtcp2_rtb_entry *ent;
+  size_t num_initial_pkt = 0;
+  size_t num_reclaim_pkt = 0;
+
+  /* The server's Initial crypto data spans two packets and neither is
+     acknowledged: a PTO retransmits both, not only the newest. A
+     client that holds the first and lost the second could otherwise
+     get the first again on every PTO and never the second. */
+  server_default_callbacks(&callbacks);
+  callbacks.recv_crypto_data = recv_crypto_data_server_large_initial;
+
+  opts = (conn_options){
+    .callbacks = &callbacks,
+  };
+
+  setup_handshake_server_with_options(&conn, opts);
+  ngtcp2_tpe_init_conn_handshake_server(&tpe, conn, &null_ckm);
+  tpe.initial.last_pkt_num = 1000;
+
+  fr.stream = (ngtcp2_stream){
+    .type = NGTCP2_FRAME_CRYPTO,
+    .datacnt = 1,
+    .data = &datav,
+  };
+  datav = (ngtcp2_vec){
+    .len = 1200,
+    .base = null_data,
+  };
+
+  pktlen = ngtcp2_tpe_write_initial(&tpe, buf, sizeof(buf), &fr, 1);
+  rv = ngtcp2_conn_read_pkt(conn, &null_path.path, NULL, buf, pktlen, ++t);
+
+  assert_int(0, ==, rv);
+
+  /* A second client datagram, so that the anti-amplification limit
+     leaves room for the probes. */
+  fr.padding = (ngtcp2_padding){
+    .type = NGTCP2_FRAME_PADDING,
+    .len = 1200,
+  };
+
+  pktlen = ngtcp2_tpe_write_initial(&tpe, buf, sizeof(buf), &fr, 1);
+  rv = ngtcp2_conn_read_pkt(conn, &null_path.path, NULL, buf, pktlen, ++t);
+
+  assert_int(0, ==, rv);
+
+  /* Datagrams of 1200 bytes, the size before path MTU discovery. */
+  for (;;) {
+    spktlen = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, 1200, ++t);
+
+    assert_ptrdiff(0, <=, spktlen);
+
+    if (spktlen == 0) {
+      break;
+    }
+  }
+
+  it = ngtcp2_ksl_begin(&conn->in_pktns->rtb.ents);
+  for (; !ngtcp2_ksl_it_end(&it); ngtcp2_ksl_it_next(&it)) {
+    ent = ngtcp2_ksl_it_get(&it);
+    if (ent->flags & NGTCP2_RTB_ENTRY_FLAG_RETRANSMITTABLE) {
+      ++num_initial_pkt;
+    }
+  }
+
+  assert_size(2, ==, num_initial_pkt);
+
+  t = ngtcp2_conn_get_expiry2(conn);
+  rv = ngtcp2_conn_handle_expiry(conn, t);
+
+  assert_int(0, ==, rv);
+
+  spktlen = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, 1200, t);
+
+  assert_ptrdiff(0, <, spktlen);
+
+  it = ngtcp2_ksl_begin(&conn->in_pktns->rtb.ents);
+  for (; !ngtcp2_ksl_it_end(&it); ngtcp2_ksl_it_next(&it)) {
+    ent = ngtcp2_ksl_it_get(&it);
+    if (ent->flags & NGTCP2_RTB_ENTRY_FLAG_PTO_RECLAIMED) {
+      ++num_reclaim_pkt;
+    }
+  }
+
+  assert_size(2, ==, num_reclaim_pkt);
 
   ngtcp2_conn_del(conn);
 }
