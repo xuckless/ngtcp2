@@ -10383,6 +10383,75 @@ static ngtcp2_ssize conn_read_handshake(ngtcp2_conn *conn,
   }
 }
 
+/*
+ * conn_server_read_handshake_rebound reads a datagram that came, while
+ * the handshake is still under way, from another remote address than
+ * the client's (the local address is the same): what a NAT rebinding
+ * looks like.  The design of QUIC relies on a stable address for the
+ * handshake (RFC 9000 section 9), and the client does not know its
+ * address changed, so it keeps retransmitting from the new one while
+ * every packet the server sends to the old one is dropped: ignoring the
+ * datagram (as before) stalls the handshake until it times out.
+ *
+ * The datagram is read as if it came on the current path.  If one of
+ * its Initial or Handshake packets is authenticated and new (it raises
+ * the largest ack-eliciting packet number of its space), the client is
+ * taken to have moved there: the current path's remote address becomes
+ * the new one, which is not validated, with an anti-amplification
+ * budget of its own (three times this datagram).  Otherwise nothing
+ * changes, and the bytes do not count toward the budget of the old
+ * address.  A replayed packet moves nothing.
+ *
+ * It returns the number of bytes read, or a negative error code as
+ * conn_read_handshake does.
+ */
+static ngtcp2_ssize conn_server_read_handshake_rebound(
+  ngtcp2_conn *conn, const ngtcp2_path *path, const ngtcp2_pkt_info *pi,
+  const uint8_t *pkt, size_t pktlen, ngtcp2_tstamp ts) {
+  int64_t in_max = conn->in_pktns ? conn->in_pktns->rx.max_ack_eliciting_pkt_num
+                                  : -1;
+  int64_t hs_max = conn->hs_pktns ? conn->hs_pktns->rx.max_ack_eliciting_pkt_num
+                                  : -1;
+  uint64_t bytes_recv = conn->dcid.current.bytes_recv;
+  uint8_t validated =
+    conn->dcid.current.flags & NGTCP2_DCID_FLAG_PATH_VALIDATED;
+  ngtcp2_ssize nread;
+
+  nread = conn_read_handshake(conn, &conn->dcid.current.ps.path, pi, pkt,
+                              pktlen, ts);
+  if (nread < 0) {
+    return nread;
+  }
+
+  if ((!conn->in_pktns ||
+       conn->in_pktns->rx.max_ack_eliciting_pkt_num == in_max) &&
+      (!conn->hs_pktns ||
+       conn->hs_pktns->rx.max_ack_eliciting_pkt_num == hs_max)) {
+    ngtcp2_log_info(&conn->log, NGTCP2_LOG_EVENT_CON,
+                    "ignore packet from unknown path during handshake");
+
+    conn->dcid.current.bytes_recv = bytes_recv;
+    /* A Handshake packet validates the address it came from, which is
+       not the current one. */
+    conn->dcid.current.flags =
+      (uint8_t)((conn->dcid.current.flags &
+                 ~NGTCP2_DCID_FLAG_PATH_VALIDATED) |
+                validated);
+
+    return nread;
+  }
+
+  ngtcp2_log_info(&conn->log, NGTCP2_LOG_EVENT_CON,
+                  "client address changed during handshake; following it");
+
+  ngtcp2_dcid_set_path(&conn->dcid.current, path);
+  conn->dcid.current.flags &= (uint8_t)~NGTCP2_DCID_FLAG_PATH_VALIDATED;
+  conn->dcid.current.bytes_sent = 0;
+  conn->dcid.current.bytes_recv = pktlen;
+
+  return nread;
+}
+
 int ngtcp2_conn_read_pkt_versioned(ngtcp2_conn *conn, const ngtcp2_path *path,
                                    int pkt_info_version,
                                    const ngtcp2_pkt_info *pi,
@@ -10439,6 +10508,32 @@ int ngtcp2_conn_read_pkt_versioned(ngtcp2_conn *conn, const ngtcp2_path *path,
     break;
   case NGTCP2_CS_SERVER_INITIAL:
   case NGTCP2_CS_SERVER_WAIT_HANDSHAKE:
+    if (!ngtcp2_path_eq(&conn->dcid.current.ps.path, path) &&
+        ngtcp2_addr_eq(&conn->dcid.current.ps.path.local, &path->local) &&
+        pktlen && (pkt[0] & NGTCP2_HEADER_FORM_BIT)) {
+      nread = conn_server_read_handshake_rebound(conn, path, pi, pkt,
+                                                 pktlen, ts);
+      if (nread < 0) {
+        return (int)nread;
+      }
+
+      if ((size_t)nread == pktlen) {
+        return 0;
+      }
+
+      if (!ngtcp2_path_eq(&conn->dcid.current.ps.path, path)) {
+        /* Nothing in it moved the client: the rest stays ignored. */
+        return 0;
+      }
+
+      assert(conn->pktns.crypto.rx.ckm);
+
+      pkt += nread;
+      pktlen -= (size_t)nread;
+
+      break;
+    }
+
     if (!ngtcp2_path_eq(&conn->dcid.current.ps.path, path)) {
       ngtcp2_log_info(&conn->log, NGTCP2_LOG_EVENT_CON,
                       "ignore packet from unknown path during handshake");
