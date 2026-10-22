@@ -97,21 +97,34 @@ int ngtcp2_pv_validate(ngtcp2_pv *pv, uint8_t *pflags,
   size_t len = ngtcp2_ringbuf_len(&pv->ents.rb);
   size_t i;
   ngtcp2_pv_entry *ent;
+  int found = 0;
+  uint8_t flags = NGTCP2_PV_ENTRY_FLAG_NONE;
 
   if (len == 0) {
     return NGTCP2_ERR_INVALID_STATE;
   }
 
+  /* The probes of a round share their data (conn_write_path_challenge),
+     and either may have been answered: the flags of all of them count,
+     so that an undersized one keeps the path from being taken as able
+     to carry full-size datagrams. */
+
   for (i = 0; i < len; ++i) {
     ent = ngtcp2_ringbuf_get(&pv->ents.rb, i);
     if (ngtcp2_cmemeq(ent->data.data, data->data, sizeof(ent->data.data))) {
-      *pflags = ent->flags;
-      ngtcp2_log_info(pv->log, NGTCP2_LOG_EVENT_PTV, "path has been validated");
-      return 0;
+      found = 1;
+      flags |= ent->flags;
     }
   }
 
-  return NGTCP2_ERR_INVALID_ARGUMENT;
+  if (!found) {
+    return NGTCP2_ERR_INVALID_ARGUMENT;
+  }
+
+  *pflags = flags;
+  ngtcp2_log_info(pv->log, NGTCP2_LOG_EVENT_PTV, "path has been validated");
+
+  return 0;
 }
 
 void ngtcp2_pv_handle_entry_expiry(ngtcp2_pv *pv, ngtcp2_tstamp ts) {

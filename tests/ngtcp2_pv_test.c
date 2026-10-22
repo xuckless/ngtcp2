@@ -147,6 +147,35 @@ void test_ngtcp2_pv_validate(void) {
   assert_int(NGTCP2_ERR_INVALID_ARGUMENT, ==, rv);
 
   ngtcp2_pv_del(pv);
+
+  /* The probes of a round share their data; an answer to it carries
+     the flags of every probe that had it, in either order, so an
+     undersized one is never overlooked. */
+  for (size_t i = 0; i < 2; ++i) {
+    rv = ngtcp2_pv_new(&pv, &dcid, timeout, NGTCP2_PV_FLAG_NONE, &log, mem);
+
+    assert_int(0, ==, rv);
+
+    data = (ngtcp2_path_challenge_data){
+      .data = {0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05},
+    };
+    ngtcp2_pv_add_entry(pv, &data, 100,
+                        i == 0 ? NGTCP2_PV_ENTRY_FLAG_UNDERSIZED
+                               : NGTCP2_PV_ENTRY_FLAG_NONE,
+                        1);
+    ngtcp2_pv_add_entry(pv, &data, 100,
+                        i == 0 ? NGTCP2_PV_ENTRY_FLAG_NONE
+                               : NGTCP2_PV_ENTRY_FLAG_UNDERSIZED,
+                        1);
+
+    flags = NGTCP2_PV_ENTRY_FLAG_NONE;
+    rv = ngtcp2_pv_validate(pv, &flags, &data);
+
+    assert_int(0, ==, rv);
+    assert_uint8(NGTCP2_PV_ENTRY_FLAG_UNDERSIZED, ==, flags);
+
+    ngtcp2_pv_del(pv);
+  }
 }
 
 void test_ngtcp2_pv_cancel_expired_timer(void) {

@@ -5272,9 +5272,22 @@ static ngtcp2_ssize conn_write_path_challenge(ngtcp2_conn *conn,
     return 0;
   }
 
-  rv = conn_call_get_path_challenge_data(conn, &lfr.path_challenge.data);
-  if (rv != 0) {
-    return rv;
+  /* The probe packets of one round carry the same challenge: the
+     second only guards against the loss of the first.  A peer that
+     receives both before it answers (several reply to the latest
+     PATH_CHALLENGE on a path only) then still echoes the data of the
+     first. */
+  if (pv->probe_pkt_left < NGTCP2_PV_NUM_PROBE_PKT &&
+      ngtcp2_ringbuf_len(&pv->ents.rb)) {
+    lfr.path_challenge.data =
+      ((ngtcp2_pv_entry *)ngtcp2_ringbuf_get(
+         &pv->ents.rb, ngtcp2_ringbuf_len(&pv->ents.rb) - 1))
+        ->data;
+  } else {
+    rv = conn_call_get_path_challenge_data(conn, &lfr.path_challenge.data);
+    if (rv != 0) {
+      return rv;
+    }
   }
 
   lfr.path_challenge.type = NGTCP2_FRAME_PATH_CHALLENGE;
