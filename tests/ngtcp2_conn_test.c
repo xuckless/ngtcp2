@@ -84,6 +84,7 @@ static const MunitTest tests[] = {
   munit_void_test(test_ngtcp2_conn_recv_retire_connection_id),
   munit_void_test(test_ngtcp2_conn_server_path_validation),
   munit_void_test(test_ngtcp2_conn_server_migration_after_nat_rebinding),
+  munit_void_test(test_ngtcp2_conn_server_path_challenge_round_data),
   munit_void_test(test_ngtcp2_conn_client_connection_migration),
   munit_void_test(test_ngtcp2_conn_recv_path_challenge),
   munit_void_test(test_ngtcp2_conn_disable_active_migration),
@@ -11368,6 +11369,121 @@ void test_ngtcp2_conn_server_migration_after_nat_rebinding(void) {
 
     ngtcp2_conn_del(conn);
   }
+}
+
+static int get_distinct_path_challenge_data(ngtcp2_conn *conn,
+                                            ngtcp2_path_challenge_data *data,
+                                            void *user_data) {
+  static uint8_t n;
+  (void)conn;
+  (void)user_data;
+
+  ++n;
+  memset(data->data, n, sizeof(data->data));
+
+  return 0;
+}
+
+void test_ngtcp2_conn_server_path_challenge_round_data(void) {
+  ngtcp2_conn *conn;
+  uint8_t buf[2048];
+  size_t pktlen;
+  ngtcp2_ssize spktlen;
+  ngtcp2_tstamp t = 900;
+  ngtcp2_frame frs[2];
+  ngtcp2_frame fr;
+  int rv;
+  ngtcp2_path_storage new_path;
+  ngtcp2_tpe tpe;
+  ngtcp2_pv_entry *ent[4];
+  size_t i;
+
+  /* A NAT rebinding: the client keeps its connection ID and its packets
+     come from a new port.  The server sends two probe packets per round;
+     they carry the same challenge, so a peer that answers only the latest
+     PATH_CHALLENGE it got on a path still answers the first one.  The
+     next round has a new challenge. */
+  path_init(&new_path, 0, 0, 2, 0);
+
+  setup_default_server(&conn);
+  conn->callbacks.get_path_challenge_data2 = get_distinct_path_challenge_data;
+  ngtcp2_tpe_init_conn(&tpe, conn);
+
+  spktlen = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ++t);
+
+  assert_ptrdiff(0, <, spktlen);
+
+  /* Large enough that the anti-amplification limit lets both probes of
+     a round out. */
+  frs[0].ping.type = NGTCP2_FRAME_PING;
+  frs[1].padding = (ngtcp2_padding){
+    .type = NGTCP2_FRAME_PADDING,
+    .len = 200,
+  };
+
+  pktlen = ngtcp2_tpe_write_1rtt(&tpe, buf, sizeof(buf), frs, 2);
+
+  rv = ngtcp2_conn_read_pkt(conn, &new_path.path, NULL, buf, pktlen, ++t);
+
+  assert_int(0, ==, rv);
+  assert_not_null(conn->pv);
+
+  for (i = 0; i < 2; ++i) {
+    spktlen = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ++t);
+
+    assert_ptrdiff(0, <, spktlen);
+  }
+
+  assert_size(2, ==, ngtcp2_ringbuf_len(&conn->pv->ents.rb));
+  assert_false(ngtcp2_pv_should_send_probe(conn->pv));
+
+  ent[0] = ngtcp2_ringbuf_get(&conn->pv->ents.rb, 0);
+  ent[1] = ngtcp2_ringbuf_get(&conn->pv->ents.rb, 1);
+
+  assert_memory_equal(sizeof(ent[0]->data.data), ent[0]->data.data,
+                      ent[1]->data.data);
+
+  /* The round expires unanswered: the next one has a new challenge. */
+  t = ngtcp2_pv_next_expiry(conn->pv);
+
+  pktlen = ngtcp2_tpe_write_1rtt(&tpe, buf, sizeof(buf), frs, 2);
+
+  rv = ngtcp2_conn_read_pkt(conn, &new_path.path, NULL, buf, pktlen, t);
+
+  assert_int(0, ==, rv);
+
+  for (i = 0; i < 2; ++i) {
+    spktlen = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ++t);
+
+    assert_ptrdiff(0, <, spktlen);
+  }
+
+  assert_size(4, ==, ngtcp2_ringbuf_len(&conn->pv->ents.rb));
+
+  ent[0] = ngtcp2_ringbuf_get(&conn->pv->ents.rb, 0);
+  ent[2] = ngtcp2_ringbuf_get(&conn->pv->ents.rb, 2);
+  ent[3] = ngtcp2_ringbuf_get(&conn->pv->ents.rb, 3);
+
+  assert_memory_equal(sizeof(ent[2]->data.data), ent[2]->data.data,
+                      ent[3]->data.data);
+  assert_memory_not_equal(sizeof(ent[0]->data.data), ent[0]->data.data,
+                          ent[2]->data.data);
+
+  /* An answer to the first round still validates the path. */
+  fr.path_response = (ngtcp2_path_response){
+    .type = NGTCP2_FRAME_PATH_RESPONSE,
+    .data = ent[0]->data,
+  };
+
+  pktlen = ngtcp2_tpe_write_1rtt(&tpe, buf, sizeof(buf), &fr, 1);
+
+  rv = ngtcp2_conn_read_pkt(conn, &new_path.path, NULL, buf, pktlen, ++t);
+
+  assert_int(0, ==, rv);
+  assert_true(ngtcp2_path_eq(&new_path.path, &conn->dcid.current.ps.path));
+  assert_true(conn->dcid.current.flags & NGTCP2_DCID_FLAG_PATH_VALIDATED);
+
+  ngtcp2_conn_del(conn);
 }
 
 void test_ngtcp2_conn_recv_path_challenge(void) {
