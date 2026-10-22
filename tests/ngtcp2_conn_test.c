@@ -85,6 +85,7 @@ static const MunitTest tests[] = {
   munit_void_test(test_ngtcp2_conn_server_path_validation),
   munit_void_test(test_ngtcp2_conn_server_migration_after_nat_rebinding),
   munit_void_test(test_ngtcp2_conn_server_path_challenge_round_data),
+  munit_void_test(test_ngtcp2_conn_server_handshake_nat_rebinding),
   munit_void_test(test_ngtcp2_conn_client_connection_migration),
   munit_void_test(test_ngtcp2_conn_recv_path_challenge),
   munit_void_test(test_ngtcp2_conn_disable_active_migration),
@@ -11482,6 +11483,93 @@ void test_ngtcp2_conn_server_path_challenge_round_data(void) {
   assert_int(0, ==, rv);
   assert_true(ngtcp2_path_eq(&new_path.path, &conn->dcid.current.ps.path));
   assert_true(conn->dcid.current.flags & NGTCP2_DCID_FLAG_PATH_VALIDATED);
+
+  ngtcp2_conn_del(conn);
+}
+
+void test_ngtcp2_conn_server_handshake_nat_rebinding(void) {
+  ngtcp2_conn *conn;
+  uint8_t buf[2048];
+  uint8_t first[2048];
+  size_t pktlen, firstlen;
+  ngtcp2_ssize spktlen;
+  ngtcp2_tstamp t = 0;
+  ngtcp2_frame fr;
+  ngtcp2_vec datav;
+  ngtcp2_path_storage new_path, other_path, ps;
+  ngtcp2_tpe tpe;
+  uint64_t bytes_recv;
+  int rv;
+
+  /* The client's address changes (a NAT rebinding) after its first
+     Initial, and it retransmits its ClientHello from the new one: the
+     server moves to it, with a budget of its own, rather than keep
+     sending to an address whose packets are dropped.  A replay of an
+     earlier packet, or one that does not authenticate, moves nothing. */
+  path_init(&new_path, 0, 0, 2, 0);
+  path_init(&other_path, 0, 0, 3, 0);
+
+  setup_handshake_server(&conn);
+  ngtcp2_tpe_init_conn_handshake_server(&tpe, conn, &null_ckm);
+
+  fr.stream = (ngtcp2_stream){
+    .type = NGTCP2_FRAME_CRYPTO,
+    .datacnt = 1,
+    .data = &datav,
+  };
+  datav = (ngtcp2_vec){
+    .len = 1200,
+    .base = null_data,
+  };
+
+  firstlen = ngtcp2_tpe_write_initial(&tpe, first, sizeof(first), &fr, 1);
+
+  rv = ngtcp2_conn_read_pkt(conn, &null_path.path, NULL, first, firstlen, ++t);
+
+  assert_int(0, ==, rv);
+
+  spktlen = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ++t);
+
+  assert_ptrdiff(0, <, spktlen);
+  assert_true(ngtcp2_path_eq(&null_path.path, &conn->dcid.current.ps.path));
+
+  bytes_recv = conn->dcid.current.bytes_recv;
+
+  /* The first Initial again, from elsewhere: a replay. */
+  rv = ngtcp2_conn_read_pkt(conn, &other_path.path, NULL, first, firstlen,
+                            ++t);
+
+  assert_int(0, ==, rv);
+  assert_true(ngtcp2_path_eq(&null_path.path, &conn->dcid.current.ps.path));
+  assert_uint64(bytes_recv, ==, conn->dcid.current.bytes_recv);
+
+  /* Bytes that do not authenticate. */
+  memcpy(buf, first, firstlen);
+  buf[firstlen - 1] ^= 0xFF;
+
+  rv = ngtcp2_conn_read_pkt(conn, &other_path.path, NULL, buf, firstlen, ++t);
+
+  assert_int(0, ==, rv);
+  assert_true(ngtcp2_path_eq(&null_path.path, &conn->dcid.current.ps.path));
+  assert_uint64(bytes_recv, ==, conn->dcid.current.bytes_recv);
+
+  /* The client's retransmission, from its new address. */
+  pktlen = ngtcp2_tpe_write_initial(&tpe, buf, sizeof(buf), &fr, 1);
+
+  rv = ngtcp2_conn_read_pkt(conn, &new_path.path, NULL, buf, pktlen, ++t);
+
+  assert_int(0, ==, rv);
+  assert_true(ngtcp2_path_eq(&new_path.path, &conn->dcid.current.ps.path));
+  assert_false(conn->dcid.current.flags & NGTCP2_DCID_FLAG_PATH_VALIDATED);
+  assert_uint64(pktlen, ==, conn->dcid.current.bytes_recv);
+
+  ngtcp2_path_storage_zero(&ps);
+
+  spktlen = ngtcp2_conn_write_pkt(conn, &ps.path, NULL, buf, sizeof(buf), ++t);
+
+  assert_ptrdiff(0, <, spktlen);
+  assert_true(ngtcp2_path_eq(&new_path.path, &ps.path));
+  assert_uint64(3 * pktlen, >=, conn->dcid.current.bytes_sent);
 
   ngtcp2_conn_del(conn);
 }
