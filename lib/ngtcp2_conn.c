@@ -12565,6 +12565,26 @@ ngtcp2_ssize ngtcp2_conn_write_vmsg(ngtcp2_conn *conn, ngtcp2_path *path,
     if (!conn_pacing_pkt_tx_allowed(conn, ts)) {
       assert(!ppe_pending);
 
+      /* Pacing holds back data, not path validation: the first packet
+         to a new path (after a NAT rebinding, say) is its
+         PATH_CHALLENGE, not an ACK the peer's packets on it called
+         for, which it would otherwise precede. */
+      if (!(conn->flags & NGTCP2_CONN_FLAG_AGGREGATE_PKTS)) {
+        nwrite =
+          conn_write_path_response(conn, path, pi, dest, origdestlen, ts);
+        if (nwrite) {
+          return nwrite;
+        }
+
+        if (conn->pv) {
+          nwrite =
+            conn_write_path_challenge(conn, path, pi, dest, origdestlen, ts);
+          if (nwrite) {
+            return nwrite;
+          }
+        }
+      }
+
       if (conn->server &&
           !(conn->dcid.current.flags & NGTCP2_DCID_FLAG_PATH_VALIDATED)) {
         server_tx_left = conn_server_tx_left(conn, &conn->dcid.current);

@@ -86,6 +86,7 @@ static const MunitTest tests[] = {
   munit_void_test(test_ngtcp2_conn_server_migration_after_nat_rebinding),
   munit_void_test(test_ngtcp2_conn_server_path_challenge_round_data),
   munit_void_test(test_ngtcp2_conn_server_handshake_nat_rebinding),
+  munit_void_test(test_ngtcp2_conn_server_path_challenge_while_paced),
   munit_void_test(test_ngtcp2_conn_client_connection_migration),
   munit_void_test(test_ngtcp2_conn_recv_path_challenge),
   munit_void_test(test_ngtcp2_conn_disable_active_migration),
@@ -11483,6 +11484,60 @@ void test_ngtcp2_conn_server_path_challenge_round_data(void) {
   assert_int(0, ==, rv);
   assert_true(ngtcp2_path_eq(&new_path.path, &conn->dcid.current.ps.path));
   assert_true(conn->dcid.current.flags & NGTCP2_DCID_FLAG_PATH_VALIDATED);
+
+  ngtcp2_conn_del(conn);
+}
+
+void test_ngtcp2_conn_server_path_challenge_while_paced(void) {
+  ngtcp2_conn *conn;
+  uint8_t buf[2048];
+  size_t pktlen;
+  ngtcp2_ssize spktlen;
+  ngtcp2_tstamp t = 900;
+  ngtcp2_frame frs[2];
+  int rv;
+  size_t i;
+  ngtcp2_path_storage new_path, ps;
+  ngtcp2_tpe tpe;
+
+  /* A NAT rebinding while pacing holds the server's data back: the
+     client's packets from the new port call for an ACK at once, but the
+     first packet to the new path must still be the PATH_CHALLENGE. */
+  path_init(&new_path, 0, 0, 2, 0);
+
+  setup_default_server(&conn);
+  ngtcp2_tpe_init_conn(&tpe, conn);
+
+  spktlen = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ++t);
+
+  assert_ptrdiff(0, <, spktlen);
+
+  frs[0].ping.type = NGTCP2_FRAME_PING;
+  frs[1].padding = (ngtcp2_padding){
+    .type = NGTCP2_FRAME_PADDING,
+    .len = 200,
+  };
+
+  /* Two ack-eliciting packets: the ACK is due now. */
+  for (i = 0; i < 2; ++i) {
+    pktlen = ngtcp2_tpe_write_1rtt(&tpe, buf, sizeof(buf), frs, 2);
+
+    rv = ngtcp2_conn_read_pkt(conn, &new_path.path, NULL, buf, pktlen, ++t);
+
+    assert_int(0, ==, rv);
+  }
+
+  assert_not_null(conn->pv);
+
+  conn->tx.pacing.next_ts = t + NGTCP2_SECONDS;
+
+  ngtcp2_path_storage_zero(&ps);
+
+  spktlen = ngtcp2_conn_write_pkt(conn, &ps.path, NULL, buf, sizeof(buf), ++t);
+
+  assert_ptrdiff(0, <, spktlen);
+  assert_true(ngtcp2_path_eq(&new_path.path, &ps.path));
+  assert_size(1, ==, ngtcp2_ringbuf_len(&conn->pv->ents.rb));
 
   ngtcp2_conn_del(conn);
 }
